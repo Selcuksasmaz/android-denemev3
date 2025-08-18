@@ -33,6 +33,7 @@ class RecognizeActivity : AppCompatActivity() {
 
     private val faceRecognitionHelper by lazy { FaceRecognitionHelper(this) }
     private val personDao by lazy { AppDatabase.getDatabase(this).personDao() }
+    private lateinit var faceAnalyzer: FaceAnalyzer
 
     // Veritabanindan gelen verileri hafizada tutmak icin
     private var allEmbeddings = listOf<FaceEmbedding>()
@@ -47,6 +48,8 @@ class RecognizeActivity : AppCompatActivity() {
         initViews()
         setupListeners()
         loadDataFromDatabase()
+
+        faceAnalyzer = FaceAnalyzer(::onFaceDetected, ::onNoFaceDetected)
     }
 
     private fun initViews() {
@@ -99,7 +102,7 @@ class RecognizeActivity : AppCompatActivity() {
             val imageAnalysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
-                .also { it.setAnalyzer(cameraExecutor!!, FaceAnalyzer()) }
+                .also { it.setAnalyzer(cameraExecutor!!, faceAnalyzer) }
 
             val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
 
@@ -116,37 +119,17 @@ class RecognizeActivity : AppCompatActivity() {
         cameraProvider?.unbindAll()
     }
 
-    private inner class FaceAnalyzer : ImageAnalysis.Analyzer {
-        @androidx.camera.core.ExperimentalGetImage
-        override fun analyze(imageProxy: ImageProxy) {
-            if (!recognitionActive) {
-                imageProxy.close()
-                return
-            }
+    private fun onFaceDetected(face: com.google.mlkit.vision.face.Face, bitmap: Bitmap) {
+        lifecycleScope.launch(Dispatchers.Default) {
+            val croppedFace = faceRecognitionHelper.cropFace(bitmap, face, 20)
+            val currentEmbedding = faceRecognitionHelper.extractFaceEmbedding(croppedFace)
+            findBestMatch(currentEmbedding)
+        }
+    }
 
-            val mediaImage = imageProxy.image ?: run { imageProxy.close(); return }
-            val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-            val bitmap = imageProxy.toBitmap() // Analiz için bitmap oluştur
-
-            lifecycleScope.launch(Dispatchers.Default) {
-                val faces = faceRecognitionHelper.detectFaces(bitmap)
-
-                if (faces.isNotEmpty()) {
-                    val face = faces[0]
-                    val croppedFace = faceRecognitionHelper.cropFace(bitmap, face, 20)
-                    val currentEmbedding = faceRecognitionHelper.extractFaceEmbedding(croppedFace)
-
-                    findBestMatch(currentEmbedding)
-                } else {
-                    withContext(Dispatchers.Main) {
-                        tvRecognitionResult.text = "Yüz bulunamadı"
-                    }
-                }
-
-                withContext(Dispatchers.Main) {
-                    imageProxy.close()
-                }
-            }
+    private fun onNoFaceDetected() {
+        runOnUiThread {
+            tvRecognitionResult.text = "Yüz bulunamadı"
         }
     }
 
@@ -158,6 +141,7 @@ class RecognizeActivity : AppCompatActivity() {
 
         for (storedEmbedding in allEmbeddings) {
             val similarity = faceRecognitionHelper.compareFaces(storedEmbedding.embedding, currentEmbedding)
+            Log.d("RecognizeActivity", "Comparing with personId: ${storedEmbedding.personId}, similarity: $similarity")
             if (similarity > highestSimilarity) {
                 highestSimilarity = similarity
                 bestMatch = storedEmbedding
@@ -166,10 +150,12 @@ class RecognizeActivity : AppCompatActivity() {
 
         runOnUiThread {
             if (highestSimilarity >= SIMILARITY_THRESHOLD && bestMatch != null) {
-                val personName = personIdToNameMap[bestMatch.personId] ?: "Bilinmeyen"
+                val personName = personIdToNameMap[bestMatch!!.personId] ?: "Bilinmeyen"
                 tvRecognitionResult.text = "Tanınan: $personName\nBenzerlik: ${String.format("%.2f", highestSimilarity)}"
+                Log.d("RecognizeActivity", "Best match: $personName, similarity: $highestSimilarity")
             } else {
                 tvRecognitionResult.text = "Kişi tanınamadı"
+                Log.d("RecognizeActivity", "No match found. Highest similarity: $highestSimilarity")
             }
         }
     }
