@@ -1,28 +1,32 @@
 package com.example.yuztanima
 
 import android.content.Context
-import android.graphics.*
+import android.graphics.Bitmap
 import android.util.Log
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.support.common.FileUtil
-import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 class FaceNetModel(context: Context) {
     private val interpreter: Interpreter
     private val imgSize = 160  // FaceNet için 160x160 giriş boyutu
-    private val embedDim = 512  // FaceNet için 512 boyutunda çıkış vektörü
+    private val embedDim: Int
 
     init {
         try {
-            // TFLite modelini assets klasöründen yükle
-            val model = FileUtil.loadMappedFile(context, "facenet.tflite")
+            // Model dosyasının adı facenet_512.tflite olarak değiştirildi
+            val model = FileUtil.loadMappedFile(context, "facenet_512.tflite")
             val options = Interpreter.Options().apply {
-                setNumThreads(4) // Daha iyi performans için çoklu iş parçacığı
+                setNumThreads(4)
             }
             interpreter = Interpreter(model, options)
             Log.d("FaceNetModel", "Model başarıyla yüklendi!")
+
+            // Modelin embedding boyutu otomatik olarak tespit ediliyor
+            val outputShape = interpreter.getOutputTensor(0).shape()
+            embedDim = outputShape[1]
+            Log.d("MODEL_OUTPUT_SHAPE", "Model output shape: ${outputShape.contentToString()}")
         } catch (e: Exception) {
             Log.e("FaceNetModel", "Model yüklenirken hata: ${e.message}")
             throw RuntimeException("FaceNet modeli yüklenemedi: ${e.message}")
@@ -44,7 +48,7 @@ class FaceNetModel(context: Context) {
             scaledFace.getPixels(pixels, 0, imgSize, 0, 0, imgSize, imgSize)
 
             for (pixel in pixels) {
-                // FaceNet için normalizasyon: (2 * (pixel - 127.5)) / 255
+                // FaceNet için normalizasyon: (pixel / 127.5) - 1.0
                 imgData.putFloat(((pixel shr 16) and 0xFF) / 127.5f - 1.0f)  // R
                 imgData.putFloat(((pixel shr 8) and 0xFF) / 127.5f - 1.0f)   // G
                 imgData.putFloat((pixel and 0xFF) / 127.5f - 1.0f)           // B
@@ -59,6 +63,9 @@ class FaceNetModel(context: Context) {
             // Embedding'i normalleştir (L2 normalizasyon)
             val embedding = embeddings[0]
             val norm = normalizeEmbedding(embedding)
+
+            // Log embedding for debugging
+            Log.d("EMBEDDING_DEBUG", "Embedding: ${embedding.joinToString()}")
 
             return norm
         } catch (e: Exception) {

@@ -3,7 +3,6 @@ package com.example.yuztanima
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Matrix
 import android.graphics.Rect
 import android.util.Log
 import com.google.mlkit.vision.common.InputImage
@@ -13,9 +12,12 @@ import com.google.mlkit.vision.face.FaceDetectorOptions
 import kotlinx.coroutines.tasks.await
 import org.tensorflow.lite.Interpreter
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.MappedByteBuffer
+import java.nio.channels.FileChannel
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -34,19 +36,25 @@ class FaceRecognitionHelper(private val context: Context) {
 
     init {
         try {
-            val assetManager = context.assets
-            val modelFile = assetManager.open(MODEL_FILE)
-            val modelBytes = modelFile.readBytes()
             val options = Interpreter.Options().apply {
                 setNumThreads(4)
-                setUseNNAPI(true) // GPU veya NPU kullanımını etkinleştir
             }
-            faceNetInterpreter = Interpreter(ByteBuffer.wrap(modelBytes), options)
+            val model = loadModelFile(context, MODEL_FILE)
+            faceNetInterpreter = Interpreter(model, options)
             Log.d(TAG, "Model başarıyla yüklendi")
         } catch (e: Exception) {
             Log.e(TAG, "Model yüklenirken hata oluştu: ${e.message}")
             e.printStackTrace()
         }
+    }
+
+    private fun loadModelFile(context: Context, modelFileName: String): MappedByteBuffer {
+        val assetFileDescriptor = context.assets.openFd(modelFileName)
+        val inputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
+        val fileChannel = inputStream.channel
+        val startOffset = assetFileDescriptor.startOffset
+        val declaredLength = assetFileDescriptor.declaredLength
+        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
     }
 
     suspend fun detectFaces(bitmap: Bitmap): List<Face> {
@@ -73,13 +81,11 @@ class FaceRecognitionHelper(private val context: Context) {
     fun cropFace(bitmap: Bitmap, face: Face, padding: Int): Bitmap {
         val rect = face.boundingBox
 
-        // Padding ekleyerek yüzü genişlet
         val left = max(0, rect.left - padding)
         val top = max(0, rect.top - padding)
-        val right = minOf(bitmap.width, rect.right + padding)
-        val bottom = minOf(bitmap.height, rect.bottom + padding)
+        val right = min(bitmap.width, rect.right + padding)
+        val bottom = min(bitmap.height, rect.bottom + padding)
 
-        // Yüzü kırp
         return Bitmap.createBitmap(
             bitmap,
             left,
@@ -90,7 +96,7 @@ class FaceRecognitionHelper(private val context: Context) {
     }
 
     fun extractFaceEmbedding(faceBitmap: Bitmap): FloatArray {
-        // Görüntüyü yeniden boyutlandır
+        // 1. Görüntüyü yeniden boyutlandır
         val scaledBitmap = Bitmap.createScaledBitmap(
             faceBitmap,
             IMAGE_SIZE,
@@ -98,34 +104,29 @@ class FaceRecognitionHelper(private val context: Context) {
             true
         )
 
-        // Görüntüyü Float32 tensörüne dönüştür
-        val imgData = ByteBuffer.allocateDirect(IMAGE_SIZE * IMAGE_SIZE * 3 * 4) // 4 (float32)
+        // 2. Piksel değerlerini al
+        val intValues = IntArray(IMAGE_SIZE * IMAGE_SIZE)
+        scaledBitmap.getPixels(intValues, 0, IMAGE_SIZE, 0, 0, IMAGE_SIZE, IMAGE_SIZE)
+
+        // 3. ByteBuffer oluştur (model girişine uygun şekilde)
+        val imgData = ByteBuffer.allocateDirect(IMAGE_SIZE * IMAGE_SIZE * 3 * 4)
             .order(ByteOrder.nativeOrder())
 
-        val intValues = IntArray(IMAGE_SIZE * IMAGE_SIZE)
-        scaledBitmap.getPixels(intValues, 0, scaledBitmap.width, 0, 0,
-            scaledBitmap.width, scaledBitmap.height)
-
-        // Normalizasyon işlemi
-        for (i in 0 until IMAGE_SIZE) {
-            for (j in 0 until IMAGE_SIZE) {
-                val pixelValue = intValues[i * IMAGE_SIZE + j]
-                // Normalize pixel value to [-1,1]
-                imgData.putFloat(((pixelValue shr 16 and 0xFF) / 255.0f - 0.5f) * 2.0f)
-                imgData.putFloat(((pixelValue shr 8 and 0xFF) / 255.0f - 0.5f) * 2.0f)
-                imgData.putFloat(((pixelValue and 0xFF) / 255.0f - 0.5f) * 2.0f)
-            }
+        // 4. Normalizasyon: [-1, 1] aralığına getir
+        for (pixelValue in intValues) {
+            imgData.putFloat(((pixelValue shr 16 and 0xFF) / 255.0f - 0.5f) * 2.0f)
+            imgData.putFloat(((pixelValue shr 8 and 0xFF) / 255.0f - 0.5f) * 2.0f)
+            imgData.putFloat(((pixelValue and 0xFF) / 255.0f - 0.5f) * 2.0f)
         }
+        imgData.rewind()
 
-        // Çıktı tensörünü oluştur
-        val outputMap = mutableMapOf<Int, Any>()
-        val embeddings = Array(1) { FloatArray(512) }  // FaceNet output size: 512
-        outputMap[0] = embeddings
+        // 5. Modelin çıktısı için doğru boyut (ör: 128!)
+        val embeddings = Array(1) { FloatArray(512) }  // <--- Model çıktı boyutun 128 olmalı!
 
-        // Modeli çalıştır
+        // 6. Modeli çalıştır
         faceNetInterpreter?.run(imgData, embeddings)
 
-        // Embedding'i normalize et (L2 norm)
+        // 7. Normalizasyon (L2 norm)
         val embedding = embeddings[0]
         var sum = 0f
         for (value in embedding) {
@@ -137,98 +138,71 @@ class FaceRecognitionHelper(private val context: Context) {
                 embedding[i] = embedding[i] / norm
             }
         }
-
         return embedding
     }
 
-    // Embedding'i byte array olarak sakla
     fun storeEmbedding(embedding: FloatArray): ByteArray {
-        val byteBuffer = ByteBuffer.allocate(embedding.size * 4) // Float = 4 bytes
+        val byteBuffer = ByteBuffer.allocate(embedding.size * 4)
             .order(ByteOrder.nativeOrder())
-
         for (value in embedding) {
             byteBuffer.putFloat(value)
         }
-
         return byteBuffer.array()
     }
 
-    // Byte array'dan embedding'i geri yükle
     fun loadEmbedding(bytes: ByteArray): FloatArray {
         val byteBuffer = ByteBuffer.wrap(bytes)
             .order(ByteOrder.nativeOrder())
-
-        val embedding = FloatArray(bytes.size / 4) // Byte size / 4 (float size)
-
+        val embedding = FloatArray(bytes.size / 4)
         for (i in embedding.indices) {
             embedding[i] = byteBuffer.float
         }
-
         return embedding
     }
 
-    // İki yüz embedding'ini karşılaştır ve benzerlik skoru döndür (0-1 arası)
+    // Cosine similarity [L2 normalize edilmiş vektörler için nokta çarpımı]
     fun compareFaces(storedEmbedding: FloatArray, currentEmbedding: FloatArray): Float {
         if (storedEmbedding.size != currentEmbedding.size) {
             Log.e(TAG, "Embedding boyutları eşleşmiyor: ${storedEmbedding.size} vs ${currentEmbedding.size}")
             return 0f
         }
-
-        // Cosine similarity hesapla
         var dotProduct = 0f
         for (i in storedEmbedding.indices) {
             dotProduct += storedEmbedding[i] * currentEmbedding[i]
         }
-
-        // L2-normalize edilmiş vektörler için kosinüs benzerliği doğrudan nokta çarpımına eşittir.
-        // Değerin [-1, 1] aralığında olduğundan emin olalım.
         val similarity = max(-1f, min(1f, dotProduct))
-
-        // Skoru [0, 1] aralığına taşımak için (isteğe bağlı, benzerlik tanımına bağlı)
-        // return (similarity + 1f) / 2f
-
         return similarity
     }
 
-    // İki yüz embedding'ini karşılaştır ve benzerlik skoru döndür (0-1 arası)
     fun compareFaces(storedFaceData: ByteArray, currentFaceData: ByteArray): Float {
         val stored = loadEmbedding(storedFaceData)
         val current = loadEmbedding(currentFaceData)
-
         if (stored.size != current.size) {
             Log.e(TAG, "Embedding boyutları eşleşmiyor: ${stored.size} vs ${current.size}")
             return 0f
         }
-
-        // Cosine similarity hesapla
         var dotProduct = 0f
         var normA = 0f
         var normB = 0f
-
         for (i in stored.indices) {
             dotProduct += stored[i] * current[i]
             normA += stored[i] * stored[i]
             normB += current[i] * current[i]
         }
-
         if (normA <= 0 || normB <= 0) {
             return 0f
         }
-
         val similarity = dotProduct / (Math.sqrt(normA.toDouble()) * Math.sqrt(normB.toDouble())).toFloat()
         return if (similarity > 1f) 1f else if (similarity < 0f) 0f else similarity
     }
 
-    // Bitmap'i dosyaya kaydet
     fun saveBitmapToFile(bitmap: Bitmap, filename: String): String {
         val dir = File(context.filesDir, "faces")
         if (!dir.exists()) {
             dir.mkdirs()
         }
-
         val file = File(dir, "$filename.jpg")
         var outputStream: FileOutputStream? = null
-
         try {
             outputStream = FileOutputStream(file)
             bitmap.compress(Bitmap.CompressFormat.JPEG, 100, outputStream)
@@ -237,11 +211,9 @@ class FaceRecognitionHelper(private val context: Context) {
         } finally {
             outputStream?.close()
         }
-
         return file.absolutePath
     }
 
-    // Dosyadan bitmap yükle
     fun loadBitmapFromFile(path: String): Bitmap? {
         return try {
             val file = File(path)
